@@ -234,6 +234,12 @@ def backfill_tag_keys(keys_path: str, tag_type: str, dry_run: bool, batch_size: 
     batch = []
     comment = f"backfill {tag_type} tags from subject mapping"
 
+    # Timing accumulators
+    total_fetch_time = 0.0
+    total_migrate_time = 0.0
+    total_save_time = 0.0
+    total_delay_time = 0.0
+
     try:
         for i, key in enumerate(keys):
             # Skip works we already flushed in an earlier run
@@ -242,14 +248,18 @@ def backfill_tag_keys(keys_path: str, tag_type: str, dry_run: bool, batch_size: 
                 continue
 
             # Fetch the work JSON from Open Library (with retries if the network hiccups)
+            t0 = time.perf_counter()
             work = fetch_work(key, fetch_retries)
+            total_fetch_time += time.perf_counter() - t0
             if work is None:
                 fetch_failures += 1
                 record_keys(failed_log, [key],)
                 continue
 
             # Run the migrator - returns {} if nothing matched
+            t0 = time.perf_counter()
             tag_keys = migrator.migrate(work).get(tag_type, [])
+            total_migrate_time += time.perf_counter() - t0
             if not tag_keys:
                 continue
 
@@ -264,7 +274,9 @@ def backfill_tag_keys(keys_path: str, tag_type: str, dry_run: bool, batch_size: 
 
             # Flush the group once it reaches batch_size
             if len(batch) >= batch_size:
+                t0 = time.perf_counter()
                 updated += flush_batch(ol, batch, comment, flushed_log, failed_log)
+                total_save_time += time.perf_counter() - t0
                 batch = []
 
             # Periodic progress update
@@ -273,24 +285,42 @@ def backfill_tag_keys(keys_path: str, tag_type: str, dry_run: bool, batch_size: 
 
             # Throttle to avoid rate limiting
             if not dry_run:
+                t0 = time.perf_counter()
                 time.sleep(delay)
+                total_delay_time += time.perf_counter() - t0
 
         # Flush any leftovers in the final, incomplete group
         if batch and not dry_run:
+            t0 = time.perf_counter()
             updated += flush_batch(ol, batch, comment, flushed_log, failed_log)
+            total_save_time += time.perf_counter() - t0
             batch = []
 
     except KeyboardInterrupt:
         logger.warning("Interrupted by the user. Flushing the current batch before exiting.")
         if batch and not dry_run:
-            updated += flush_batch(ol, batch, comment, flushed_log, failed_log)
-            batch = []
+            try:
+                t0 = time.perf_counter()
+                updated += flush_batch(ol, batch, comment, flushed_log, failed_log)
+                total_save_time += time.perf_counter() - t0
+                batch = []
+            except KeyboardInterrupt:
+                logger.warning("Second interrupt — skipping flush, exiting immediately.")
+                batch = []
         logger.info(f"Interrupted. {updated} works updated so far. Re-run with --resume to continue.")
-        return
 
-    logger.info(f"Done: {updated} works updated with {tag_type} tags "
-                f"(skipped {skipped} already flushed, {fetch_failures} fetch failures). "
-                f"Failed keys are in {failed_log}")
+    finally:
+        logger.info(f"Done: {updated} works updated with {tag_type} tags "
+                    f"(skipped {skipped} already flushed, {fetch_failures} fetch failures). "
+                    f"Failed keys are in {failed_log}")
+        total_elapsed = total_fetch_time + total_migrate_time + total_save_time + total_delay_time
+        if total_elapsed > 0:
+            logger.info(f"--- Timing Summary ---")
+            logger.info(f"Fetch:    {total_fetch_time:.1f}s ({100*total_fetch_time/total_elapsed:.1f}%)")
+            logger.info(f"Migrate:  {total_migrate_time:.1f}s ({100*total_migrate_time/total_elapsed:.1f}%)")
+            logger.info(f"Save:     {total_save_time:.1f}s ({100*total_save_time/total_elapsed:.1f}%)")
+            logger.info(f"Delay:    {total_delay_time:.1f}s ({100*total_delay_time/total_elapsed:.1f}%)")
+            logger.info(f"Total:    {total_elapsed:.1f}s")
 
 
 #---------------------------------------------------------------------------
