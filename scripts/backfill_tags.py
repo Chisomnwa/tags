@@ -41,7 +41,7 @@ SAVE_TIMEOUT = 60    # seconds for the save_many POST (matches OL batch-script c
 # ---------------------------------------------------------------------------
 def fetch_works_batch(keys: list, retries: int = 3) -> dict:
     """
-    Fetch up to 100 works in a single request via /api/get_many.
+    Fetch a list of works in a single request via /api/get_many.
     Returns a dict mapping each key to its work JSON. Keys not found in OL
     are silently omitted (caller should detect missing keys).
     """
