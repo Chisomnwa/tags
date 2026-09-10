@@ -19,7 +19,6 @@ import json
 import sys
 import time
 import logging
-import requests
 from pathlib import Path
 
 logging.basicConfig(
@@ -38,24 +37,34 @@ FETCH_TIMEOUT = 30   # seconds for fetching a single work JSON
 SAVE_TIMEOUT = 60    # seconds for the save_many POST (matches OL batch-script convention)
 
 #---------------------------------------------------------------------------
-# Phase 2 helpers - fetch one work, record keys, flush a batch, POST raw dicts
+# Phase 2 helpers - fetch (batch), record keys, flush a batch, POST raw dicts
 # ---------------------------------------------------------------------------
-def fetch_work(key: str, retries: int = 3) -> dict | None:
+def fetch_works_batch(keys: list, retries: int = 3) -> dict:
     """
-    Download one work's JSON from Open Library, retrying with a short wait
-    if the network hiccups. Returns the work dict, or None if it never succeeds.
+    Fetch several works by keys in a single request via /api/get_many.
+    Returns a dict mapping each key to its work JSON. Keys not found in OL
+    are silently omitted (caller should detect missing keys).
     """
+    ol = get_ol_session()
+    params = {"keys": json.dumps(keys)}
     for attempt in range(retries):
         try:
-            resp = requests.get(f"https://openlibrary.org{key}.json", timeout=FETCH_TIMEOUT)
+            resp = ol.session.get(
+                f"{ol.base_url}/api/get_many",
+                params=params,
+                timeout=FETCH_TIMEOUT,
+            )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if data.get("status") == "ok":
+                return data.get("result", {})
+            logger.warning(f"/api/get_many returned status={data.get('status')}; retrying")
         except Exception as e:
-            wait = 5 * (2 ** attempt)           # waits 5s, then 10s, then 20s
-            logger.warning(f"Could not fetch {key} ({e}); waiting {wait}s and retrying")
+            wait = 5 * (2 ** attempt)
+            logger.warning(f"Batch fetch failed ({e}); waiting {wait}s and retrying ({attempt + 1}/{retries})")
             time.sleep(wait)
-    logger.error(f"Could not fetch {key} after {retries} tries")
-    return None
+    logger.error(f"Batch fetch failed after {retries} tries for {len(keys)} keys")
+    return {}
 
 
 def record_keys(path: str, keys: list, unique: bool = False) -> None:
@@ -241,36 +250,58 @@ def backfill_tag_keys(keys_path: str, tag_type: str, dry_run: bool, batch_size: 
     total_delay_time = 0.0
 
     try:
-        for i, key in enumerate(keys):
-            # Skip works we already flushed in an earlier run
-            if key in already_flushed:
+        i = 0
+        while i < len(keys):
+            # Skip keys we already flushed
+            if keys[i] in already_flushed:
                 skipped += 1
+                i += 1
                 continue
 
-            # Fetch the work JSON from Open Library (with retries if the network hiccups)
+            # Collect up to batch_size keys for a single fetch request
+            fetch_keys = []
+            for j in range(i, min(i + batch_size, len(keys))):
+                if keys[j] not in already_flushed:
+                    fetch_keys.append(keys[j])
+            i += len(fetch_keys)
+
+            if not fetch_keys:
+                continue
+
+            # Fetch 100 works in one HTTP request
             t0 = time.perf_counter()
-            work = fetch_work(key, fetch_retries)
+            works = fetch_works_batch(fetch_keys, fetch_retries)
             total_fetch_time += time.perf_counter() - t0
-            if work is None:
-                fetch_failures += 1
-                record_keys(failed_log, [key],)
+
+            if not works:
+                fetch_failures += len(fetch_keys)
+                record_keys(failed_log, fetch_keys, unique=True)
+                logger.warning(f"Batch fetch returned 0 works for {len(fetch_keys)} keys")
                 continue
 
-            # Run the migrator - returns {} if nothing matched
-            t0 = time.perf_counter()
-            tag_keys = migrator.migrate(work).get(tag_type, [])
-            total_migrate_time += time.perf_counter() - t0
-            if not tag_keys:
-                continue
+            # Track keys that weren't in the response
+            fetched_keys = set(works.keys())
+            missing = [k for k in fetch_keys if k not in fetched_keys]
+            if missing:
+                fetch_failures += len(missing)
+                record_keys(failed_log, missing, unique=True)
 
-            if dry_run:
-                # Preview mode: log what we would write
-                logger.info(f"{key}: {tag_type} = {tag_keys}")
-                continue
+            # Process each fetched work
+            for key, work in works.items():
+                # Run the migrator - returns {} if nothing matched
+                t0 = time.perf_counter()
+                tag_keys = migrator.migrate(work).get(tag_type, [])
+                total_migrate_time += time.perf_counter() - t0
+                if not tag_keys:
+                    continue
 
-            # Set the typed field (e.g work["genres"] = ["/tags/OL179T"])
-            work[tag_type] = tag_keys
-            batch.append(work)
+                if dry_run:
+                    logger.info(f"{key}: {tag_type} = {tag_keys}")
+                    continue
+
+                # Set the typed field (e.g work["genres"] = ["/tags/OL179T"])
+                work[tag_type] = tag_keys
+                batch.append(work)
 
             # Flush the group once it reaches batch_size
             if len(batch) >= batch_size:
@@ -280,10 +311,10 @@ def backfill_tag_keys(keys_path: str, tag_type: str, dry_run: bool, batch_size: 
                 batch = []
 
             # Periodic progress update
-            if (i + 1) % 1000 == 0:
-                logger.info(f"Processed {i+1}/{total} (updated {updated}, skipped {skipped}, fetch failures {fetch_failures})")
+            if i % 1000 == 0 or i == len(keys):
+                logger.info(f"Processed {i}/{total} (updated {updated}, skipped {skipped}, fetch failures {fetch_failures})")
 
-            # Throttle to avoid rate limiting
+            # Throttle between fetch batches
             if not dry_run:
                 t0 = time.perf_counter()
                 time.sleep(delay)
